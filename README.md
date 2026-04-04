@@ -4,7 +4,7 @@ Project-scoped Linux environments with venv-like UX for Windows developers.
 
 ## Installation
 ```bash
-pip install lenv
+pip install lenv-manager
 ```
 
 ## Quick Start

@@ -39,21 +39,24 @@ def main():
     args = parser.parse_args()
     
     try:
-        env = LENV()
-        
         if args.command == 'init':
-            env.init(distro=args.distro)
-        elif args.command == 'activate':
-            env.activate()
-        elif args.command == 'run':
-            command = ' '.join(args.cmd)
-            env.run(command)
-        elif args.command == 'destroy':
-            env.destroy()
-        elif args.command == 'status':
-            env.status()
+            env = LENV(distro_set=args.distro)
+            env.init()
         else:
-            parser.print_help()
+            env = LENV()
+    
+            if args.command == 'activate':
+                env.activate()
+            elif args.command == 'run':
+                command = ' '.join(args.cmd)
+                env.run(command)
+            elif args.command == 'destroy':
+                env.destroy()
+            elif args.command == 'status':
+                env.status()
+            else:
+                parser.print_help()
+
     
     except KeyboardInterrupt:
         print("\n\n  Interrupted by user")
