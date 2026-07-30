@@ -127,6 +127,12 @@ class LENV:
 
     # ── Rootfs download ────────────────────────────────────────────────────────
 
+    def _format_size(self, size_bytes):
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024:
+                return f"{size_bytes:.2f} {unit}"
+            size_bytes /= 1024
+
     def _download_rootfs(self):
         """Download minimal Linux rootfs"""
         rootfs_urls = {
@@ -145,7 +151,14 @@ class LENV:
         self.distro_set = self._distro_choice()
 
         if self.distro_set not in rootfs_urls:
-            raise ValueError(f"Unknown distro: {self.distro_set}")
+            distro_path = Path(input("Enter the path to your custom rootfs tarball: ").strip())
+            if not distro_path.exists():
+                print("File not found.")
+                sys.exit(1)
+            distro_size = distro_path.stat().st_size
+            print(f"Size: {self._format_size(distro_size)}")
+            return str(distro_path)
+        
 
         info = rootfs_urls[self.distro_set]
         rootfs_path = self.rootfs_cache / info["filename"]
@@ -216,7 +229,7 @@ class LENV:
 
         self.instance_ip = self._assign_ip()
         veth      = self._veth_name()          # vlenv-abc123
-        veth_br   = f"{veth}-br"              # vlenv-abc123-br  (14 chars ✓)
+        veth_br   = f"{veth}-br"              # vlenv-abc123-br  (14 chars)
 
         # Full setup script — runs inside the WSL instance as root
         # NOTE: No 'set -e' — every step is independent and idempotent
