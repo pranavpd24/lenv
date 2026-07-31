@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lenv-manager"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Project-scoped Linux environments for Windows developers"
 readme = "README.md"
 authors = [
@@ -30,3 +30,6 @@ Repository = "https://github.com/pranavpd24/lenv"
 
 [project.scripts]
 lenv = "lenv.cli:main"  # Creates the 'lenv' command
+
+[tool.setuptools.dynamic]
+version = {attr = "lenv.__version__"}

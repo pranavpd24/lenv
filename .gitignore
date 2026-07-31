@@ -3,3 +3,5 @@ dist/
 __pycache__/
 lenv_manager.egg-info/
 .idea/
+lenv/builds/
+AGENTS.md

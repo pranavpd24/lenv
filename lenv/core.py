@@ -16,7 +16,7 @@ LENV_SUBNET   = "10.100.0.0/16"
 
 
 class LENV:
-    def __init__(self, project_path=None, distro_set=None):
+    def __init__(self, project_path=None, distro_set=None, rootfs_path=None):
         self.project_path = project_path or os.getcwd()
         self.project_name = os.path.basename(self.project_path)
 
@@ -35,6 +35,7 @@ class LENV:
         self.rootfs_cache.mkdir(exist_ok=True)
 
         self.distro_set = distro_set
+        self.rootfs_path = rootfs_path
         self.instance_ip = None          # filled after network setup
 
     # ── Config ─────────────────────────────────────────────────────────────────
@@ -100,6 +101,14 @@ class LENV:
             print("\nPlease install WSL2 and run 'lenv init' again.")
             sys.exit(1)
 
+    def _wsl_output(self, args):
+        result = subprocess.run(["wsl"]+ args, capture_output=True,timeout=10)
+        raw = result.stdout
+        if b"\x00" in raw:
+            return raw.decode("utf-16-le", errors="replace")
+        return raw.decode("utf-8", errors="replace")
+
+
     # ── Distro choice ──────────────────────────────────────────────────────────
 
     def _distro_choice(self):
@@ -135,6 +144,15 @@ class LENV:
 
     def _download_rootfs(self):
         """Download minimal Linux rootfs"""
+        if self.rootfs_path:
+            path = Path(self.rootfs_path)
+            if not path.exists():
+                print(f"Provided rootfs path does not exist: {path}")
+                sys.exit(1)
+            if path.suffixes[-2:] not in (['.tar', '.gz'], ['.tar', '.xz']) and path.suffix != '.tar':
+                print(f"Provided rootfs path is not a valid tarball: {path}")
+                sys.exit(1)
+            return str(path)
         rootfs_urls = {
             "alpine": {
                 "url": "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-minirootfs-3.19.0-x86_64.tar.gz",
@@ -148,7 +166,8 @@ class LENV:
             },
         }
 
-        self.distro_set = self._distro_choice()
+        if self.distro_set is None:
+            self.distro_set = self._distro_choice() 
 
         if self.distro_set not in rootfs_urls:
             distro_path = Path(input("Enter the path to your custom rootfs tarball: ").strip())
@@ -400,8 +419,16 @@ ip link del {veth_br} 2>/dev/null || true
 
         # BUG FIX: project_path is a str, must wrap in Path() before using /
         gitignore = Path(self.project_path) / ".gitignore"
-        with open(gitignore, "a") as f:
-            f.write(".lenv\n")
+        existing = gitignore.read_text() if gitignore.exists() else ""
+
+        if ".lenv" not in existing.splitlines():
+            with open(gitignore, "a") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                f.write(".lenv\n")
+
+
+        
 
         print(f"LENV instance initialised: {self.instance_name}")
         if self.instance_ip:
@@ -484,6 +511,30 @@ ip link del {veth_br} 2>/dev/null || true
 
         print(f"Destroyed environment: {self.instance_name}")
 
+
+    def list_instances(self):
+        result = self._wsl_output(["--list", "--verbose"])
+        rows = []
+        for line in result.splitlines():
+            line = line.strip().lstrip("*").strip()
+            if not line.startswith("lenv-"):
+                continue
+
+            parts = line.split()
+            name = parts[0]
+            state = parts[1] if len(parts)>1 else "Unknown"
+            rows.append((name, state))
+
+        if not rows:
+            print("No lenv environments found on this machine.")
+            return
+
+        print(f"{'INSTANCE': <35} {'STATE': <10}")
+        print("#"*45)
+        for name, state in rows:
+            print(f"{name: <35} {state: <10}")
+
+
     def status(self):
         self._load_config()
         print(f"Project:  {self.project_name}")
@@ -498,19 +549,11 @@ ip link del {veth_br} 2>/dev/null || true
         if self.instance_ip:
             print(f"IP:       {self.instance_ip}")
 
-        result = subprocess.run(
-            ["wsl", "--list", "--quiet"],
-            capture_output=True, text=True,
-        )
 
-        if self.instance_name in result.stdout:
+        if self.instance_name in self._wsl_output(["--list", "--quiet"]):
             print(f"WSL Instance:  {self.instance_name}")
 
-            result = subprocess.run(
-                ["wsl", "--list", "--running"],
-                capture_output=True, text=True,
-            )
-            if self.instance_name in result.stdout:
+            if self.instance_name in self._wsl_output(["--list", "--running"]):
                 print("State:    Running")
             else:
                 print("State:    Stopped")
