@@ -10,6 +10,7 @@ project directory, created and destroyed with a single command.
 [![Python](https://img.shields.io/pypi/pyversions/lenv-manager.svg)](https://pypi.org/project/lenv-manager/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+
 ## Why LENV?
 
 - **venv-like UX** — `lenv init`, `lenv activate`, `lenv destroy`. If you know venv, you know LENV.
