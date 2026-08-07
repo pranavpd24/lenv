@@ -3,6 +3,17 @@ from .core import LENV
 import sys
 from . import __version__
 
+def _print_full_help(parser, subparsers):
+    """Top-level help followed by every subcommand's full option list,
+    so a bare `lenv` shows everything the CLI can do."""
+    parser.print_help()
+    print("\n" + "=" * 60)
+    print("Options for each command")
+    print("=" * 60)
+    for name, sub in subparsers.choices.items():
+        print()
+        sub.print_help()
+
 def main():
     
     parser = argparse.ArgumentParser(
@@ -20,7 +31,7 @@ def main():
     # lenv init
     init_parser = subparsers.add_parser(
         'init', 
-        help='Intialize environment (auto-installs WSL2 if needed)'
+        help='Initialize environment (auto-installs WSL2 if needed)'
     )
     init_parser.add_argument(
         '--distro',
@@ -34,6 +45,12 @@ def main():
         default=None,
         help='Path to a custom rootfs tarball (skips prompt and download)'
     )
+    init_parser.add_argument(
+        '--build',
+        metavar='NAME',
+        default=None,
+        help='Install a bundled package set from lenv/builds/<name>.yaml'
+    )
     
     # lenv activate
     subparsers.add_parser('activate', help='Enter Linux environment')
@@ -43,7 +60,12 @@ def main():
     run_parser.add_argument('cmd', nargs='+')
     
     # lenv destroy
-    subparsers.add_parser('destroy', help='Remove environment')
+    destroy_parser = subparsers.add_parser('destroy', help='Remove environment')
+    destroy_parser.add_argument(
+        '--yes', '-y',
+        action='store_true',
+        help='Skip the confirmation prompt'
+    )
     
     # lenv status
     subparsers.add_parser('status', help='Show environment status')
@@ -55,8 +77,12 @@ def main():
     args = parser.parse_args()
     
     try:
+        if args.command is None:
+            _print_full_help(parser, subparsers)
+            return
+
         if args.command == 'init':
-            env = LENV(distro_set=args.distro, rootfs_path=args.rootfs)
+            env = LENV(distro_set=args.distro, rootfs_path=args.rootfs, build=args.build)
             env.init()
         else:
             env = LENV()
@@ -65,15 +91,15 @@ def main():
                 env.activate()
             elif args.command == 'run':
                 command = ' '.join(args.cmd)
-                env.run(command)
+                sys.exit(env.run(command))
             elif args.command == 'destroy':
-                env.destroy()
+                env.destroy(assume_yes=args.yes)
             elif args.command == 'status':
                 env.status()
             elif args.command == 'list':
                 env.list_instances()
             else:
-                parser.print_help()
+                _print_full_help(parser, subparsers)
 
     
     except KeyboardInterrupt:
@@ -85,7 +111,6 @@ def main():
     
 if __name__ == '__main__':
     main()
-
 
 
 

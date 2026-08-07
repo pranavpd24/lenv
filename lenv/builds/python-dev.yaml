@@ -1,0 +1,10 @@
+name: python-dev
+description: Python 3 with pip, git and C build tools (for compiling wheels)
+distro: alpine
+packages: 
+  - python3
+  - py3-pip
+  - git
+  - gcc 
+  - musl-dev
+  - linux-headers

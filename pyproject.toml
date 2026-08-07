@@ -33,3 +33,6 @@ lenv = "lenv.cli:main"  # Creates the 'lenv' command
 
 [tool.setuptools.dynamic]
 version = {attr = "lenv.__version__"}
+
+[tool.setuptools.package-data]
+lenv = ["builds/*.yaml"]

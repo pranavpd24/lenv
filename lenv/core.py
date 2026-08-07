@@ -1,9 +1,13 @@
 import subprocess
 import os
 import sys
+import re
 import json
+import shutil
+import tarfile
+import tempfile
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import urllib.request
 import hashlib
 import time
@@ -14,11 +18,24 @@ LENV_GATEWAY  = "10.100.0.1"
 LENV_SUBNET   = "10.100.0.0/16"
 # ───────────────────────────────────────────────────────────────────────────────
 
+# Instance names created by lenv always look like: lenv-<folder>-<8 hex chars>.
+# Anything loaded from .lenv/config.json that does NOT match this pattern is
+# rejected, so a tampered config can never point lenv at an unrelated distro.
+_INSTANCE_NAME_RE = re.compile(r"^lenv-[A-Za-z0-9._-]+-[0-9a-f]{8}$")
+
+# Package names from build files are interpolated into shell commands, so they
+# must be validated before use.
+_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:-]*$")
+
 
 class LENV:
-    def __init__(self, project_path=None, distro_set=None, rootfs_path=None):
+    def __init__(self, project_path=None, distro_set=None, rootfs_path=None, build=None):
         self.project_path = project_path or os.getcwd()
-        self.project_name = os.path.basename(self.project_path)
+
+        # The folder name becomes part of the WSL instance name — restrict it
+        # to characters that are safe for WSL distro names and shell usage.
+        raw_name = os.path.basename(self.project_path) or "project"
+        self.project_name = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_name).strip("-.") or "project"
 
         self._path_hash = hashlib.md5(
             str(Path(self.project_path).absolute()).encode()
@@ -36,7 +53,8 @@ class LENV:
 
         self.distro_set = distro_set
         self.rootfs_path = rootfs_path
-        self.instance_ip = None          # filled after network setup
+        self.build = build                 # optional build name (lenv/builds/<name>.yaml)
+        self.instance_ip = None            # filled after network setup
 
     # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -44,9 +62,14 @@ class LENV:
         if self.config_file.exists():
             with open(self.config_file) as f:
                 config = json.load(f)
-            self.instance_name = config.get("instance_name", self.instance_name)
-            self.distro_set    = config.get("distro",         self.distro_set)
-            self.instance_ip   = config.get("ip",             self.instance_ip)
+            stored_name = config.get("instance_name")
+            # Only trust a stored instance name that matches the lenv naming
+            # scheme; otherwise fall back to the name computed from the path.
+            if stored_name and _INSTANCE_NAME_RE.fullmatch(stored_name):
+                self.instance_name = stored_name
+            self.distro_set  = config.get("distro", self.distro_set)
+            self.instance_ip = config.get("ip",     self.instance_ip)
+            self.build       = config.get("build",  self.build)
 
     # ── WSL helpers ────────────────────────────────────────────────────────────
 
@@ -60,11 +83,11 @@ class LENV:
             return False
 
     def _check_wsl2_version(self):
+        # wsl --status emits UTF-16 on Windows — decode via _wsl_output so the
+        # version check actually sees the text instead of garbage bytes.
         try:
-            result = subprocess.run(
-                ["wsl", "--status"], capture_output=True, text=True
-            )
-            return "WSL 2" in result.stdout or "version: 2" in result.stdout
+            output = self._wsl_output(["--status"]).lower()
+            return "wsl 2" in output or "version: 2" in output or "version 2" in output
         except Exception:
             return False
 
@@ -137,32 +160,71 @@ class LENV:
     # ── Rootfs download ────────────────────────────────────────────────────────
 
     def _format_size(self, size_bytes):
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size_bytes < 1024:
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size_bytes < 1024 or unit == 'TB':
                 return f"{size_bytes:.2f} {unit}"
             size_bytes /= 1024
 
+    def _sha256_file(self, path):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _fetch_expected_sha256(self, info):
+        """
+        Fetch the upstream SHA-256 checksum for a rootfs.
+        Handles both Alpine-style '<hash>  <filename>' .sha256 files and
+        Ubuntu-style SHA256SUMS lists ('<hash> *<filename>').
+        Returns the lowercase hex digest, or None if it cannot be determined.
+        """
+        try:
+            with urllib.request.urlopen(info["sha256_url"], timeout=15) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
+        for line in text.splitlines():
+            parts = line.replace("*", " ").split()
+            if len(parts) == 2 and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+                if parts[1] == info["filename"]:
+                    return parts[0].lower()
+            elif len(parts) == 1 and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+                return parts[0].lower()
+        return None
+
+    def _validate_custom_rootfs(self, path):
+        """Validate a user-supplied rootfs tarball (extension + real tar check)."""
+        if not path.exists():
+            print(f"Provided rootfs path does not exist: {path}")
+            sys.exit(1)
+        if path.suffixes[-2:] not in (['.tar', '.gz'], ['.tar', '.xz']) and path.suffix != '.tar':
+            print(f"Provided rootfs path is not a valid tarball: {path}")
+            sys.exit(1)
+        if not tarfile.is_tarfile(path):
+            print(f"Provided rootfs is not a readable tar archive: {path}")
+            sys.exit(1)
+        print(f"Using custom rootfs ({self._format_size(path.stat().st_size)})")
+        return str(path)
+
     def _download_rootfs(self):
-        """Download minimal Linux rootfs"""
+        """Download minimal Linux rootfs, with SHA-256 integrity verification."""
         if self.rootfs_path:
-            path = Path(self.rootfs_path)
-            if not path.exists():
-                print(f"Provided rootfs path does not exist: {path}")
-                sys.exit(1)
-            if path.suffixes[-2:] not in (['.tar', '.gz'], ['.tar', '.xz']) and path.suffix != '.tar':
-                print(f"Provided rootfs path is not a valid tarball: {path}")
-                sys.exit(1)
-            return str(path)
+            return self._validate_custom_rootfs(Path(self.rootfs_path))
+
         rootfs_urls = {
             "alpine": {
                 "url": "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-minirootfs-3.19.0-x86_64.tar.gz",
                 "filename": "alpine-minirootfs-3.19.0-x86_64.tar.gz",
                 "size_mb": 3,
+                "sha256_url": "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-minirootfs-3.19.0-x86_64.tar.gz.sha256",
             },
             "ubuntu": {
                 "url": "https://cloud-images.ubuntu.com/minimal/releases/jammy/release/ubuntu-22.04-minimal-cloudimg-amd64-root.tar.xz",
                 "filename": "ubuntu-22.04-minimal-cloudimg-amd64-root.tar.xz",
                 "size_mb": 50,
+                "sha256_url": "https://cloud-images.ubuntu.com/minimal/releases/jammy/release/SHA256SUMS",
             },
         }
 
@@ -171,39 +233,115 @@ class LENV:
 
         if self.distro_set not in rootfs_urls:
             distro_path = Path(input("Enter the path to your custom rootfs tarball: ").strip())
-            if not distro_path.exists():
-                print("File not found.")
-                sys.exit(1)
-            distro_size = distro_path.stat().st_size
-            print(f"Size: {self._format_size(distro_size)}")
-            return str(distro_path)
-        
+            return self._validate_custom_rootfs(distro_path)
+
 
         info = rootfs_urls[self.distro_set]
         rootfs_path = self.rootfs_cache / info["filename"]
+        expected = self._fetch_expected_sha256(info)
 
         if rootfs_path.exists():
-            print(f"Using cached {self.distro_set} rootfs")
-            return str(rootfs_path)
+            if expected:
+                if self._sha256_file(rootfs_path) == expected:
+                    print(f"Using cached {self.distro_set} rootfs (checksum verified)")
+                    return str(rootfs_path)
+                print("  Cached rootfs failed checksum verification - re-downloading.")
+                rootfs_path.unlink()
+            else:
+                print("  Warning: checksum unavailable, using cached rootfs unverified.")
+                return str(rootfs_path)
+
+        if expected is None:
+            # Fail closed: never install a fresh download we cannot verify.
+            print("Could not fetch the official SHA-256 checksum - refusing to")
+            print("download an unverified rootfs. Check your connection and retry.")
+            sys.exit(1)
 
         print(f"Downloading {self.distro_set} rootfs (~{info['size_mb']}MB)...")
         print(f"   From: {info['url']}")
 
-        try:
-            def reporthook(count, block_size, total_size):
-                percent = int(count * block_size * 100 / total_size)
+        def reporthook(count, block_size, total_size):
+            if total_size and total_size > 0:
+                percent = min(100, int(count * block_size * 100 / total_size))
                 sys.stdout.write(f"\r   Progress: {percent}%")
-                sys.stdout.flush()
+            else:
+                sys.stdout.write(f"\r   Downloaded: {self._format_size(count * block_size)}")
+            sys.stdout.flush()
 
-            urllib.request.urlretrieve(info["url"], rootfs_path, reporthook=reporthook)
+        # Download to a temp file first so a failed/partial download can never
+        # be mistaken for a valid cached rootfs on the next run.
+        fd, tmp_name = tempfile.mkstemp(dir=self.rootfs_cache, prefix=".dl-", suffix=".part")
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+
+        try:
+            urllib.request.urlretrieve(info["url"], tmp_name, reporthook=reporthook)
             print("\n Download complete")
-            return str(rootfs_path)
-
         except Exception as e:
+            tmp_path.unlink(missing_ok=True)
             print(f"\n Download failed: {e}")
             print(f"Please download manually from: {info['url']}")
             print(f"Save to: {rootfs_path}")
             sys.exit(1)
+
+        if self._sha256_file(tmp_path) != expected:
+            tmp_path.unlink(missing_ok=True)
+            print(" Downloaded rootfs FAILED SHA-256 verification - file deleted.")
+            print("The upstream mirror may be corrupted; try again later.")
+            sys.exit(1)
+
+        print(" SHA-256 checksum verified")
+        tmp_path.replace(rootfs_path)   # atomic move within the same directory
+        return str(rootfs_path)
+
+    # ── Builds (bundled package sets) ───────────────────────────────────────────
+
+    def _load_build(self, name):
+        """
+        Load a bundled build definition from lenv/builds/<name>.yaml.
+        Supports the simple subset of YAML used by the bundled files:
+
+            name: minimal
+            description: ...
+            distro: alpine
+            packages:
+              - ca-certificates
+        """
+        if not name or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            print(f"Invalid build name: {name!r}")
+            sys.exit(1)
+
+        path = Path(__file__).resolve().parent / "builds" / f"{name}.yaml"
+        if not path.exists():
+            available = ", ".join(sorted(p.stem for p in path.parent.glob("*.yaml"))) or "none"
+            print(f"Unknown build '{name}'. Available builds: {available}")
+            sys.exit(1)
+
+        build = {"name": name, "description": "", "distro": None, "packages": []}
+        in_packages = False
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("- "):
+                if in_packages:
+                    pkg = stripped[2:].strip()
+                    if not _PACKAGE_NAME_RE.fullmatch(pkg):
+                        print(f"Unsafe package name in {path.name}: {pkg!r}")
+                        sys.exit(1)
+                    build["packages"].append(pkg)
+                continue
+            in_packages = False
+            key, sep, value = stripped.partition(":")
+            if not sep:
+                continue
+            key, value = key.strip(), value.strip()
+            if key == "packages":
+                in_packages = True
+            elif key in ("description", "distro"):
+                build[key] = value or None
+
+        return build
 
     # ── Network isolation ──────────────────────────────────────────────────────
 
@@ -252,6 +390,8 @@ class LENV:
 
         # Full setup script — runs inside the WSL instance as root
         # NOTE: No 'set -e' — every step is independent and idempotent
+        # All interpolated values are lenv-generated (hex hashes, computed IPs),
+        # never raw user input.
         script = f"""
 # ── 1. Install networking tools if missing ──────────────────────────────
 if ! command -v ip > /dev/null 2>&1; then
@@ -289,11 +429,13 @@ iptables -t nat -C POSTROUTING -s {LENV_SUBNET} -j MASQUERADE 2>/dev/null \
     || iptables -t nat -A POSTROUTING -s {LENV_SUBNET} -j MASQUERADE 2>/dev/null
 
 # ── 5. Persist config so network re-applies on WSL restart ──────────────
+# NOTE: no shell variables here — wsl.exe expands every $VAR in the command
+# line against the distro environment before ash ever runs (even inside
+# single quotes), so $PROFILE would arrive pre-expanded (and empty).
 mkdir -p /etc/profile.d
-PROFILE=/etc/profile.d/lenv-net.sh
 printf '%s\n' \
   '# lenv network isolation - re-apply on shell start' \
-  '_lenv_net() {' \
+  '_lenv_net() {{' \
   "  ip link show {LENV_BRIDGE} > /dev/null 2>&1 || ip link add {LENV_BRIDGE} type bridge 2>/dev/null" \
   "  ip link show {LENV_BRIDGE} > /dev/null 2>&1 && ip addr replace {LENV_GATEWAY}/16 dev {LENV_BRIDGE} 2>/dev/null" \
   "  ip link show {LENV_BRIDGE} > /dev/null 2>&1 && ip link set {LENV_BRIDGE} up 2>/dev/null" \
@@ -303,10 +445,10 @@ printf '%s\n' \
   "  ip link show {veth} > /dev/null 2>&1 && ip link set {veth} up 2>/dev/null" \
   "  ip link show {veth} > /dev/null 2>&1 && ip addr replace {self.instance_ip}/16 dev {veth} 2>/dev/null" \
   "  echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null" \
-  '}' \
+  '}}' \
   '_lenv_net' \
-  > "$PROFILE"
-chmod +x "$PROFILE"
+  > /etc/profile.d/lenv-net.sh
+chmod +x /etc/profile.d/lenv-net.sh
 """
 
         shell = "bash" if self.distro_set == "ubuntu" else "ash"
@@ -368,8 +510,8 @@ ip link del {veth_br} 2>/dev/null || true
         print("WSL instance created successfully")
 
     def _configure_instance(self):
-        """Install base packages and configure networking."""
-        print(" Installing Python and essential tools...")
+        """Install base packages (plus optional build packages) and networking."""
+        print(" Installing essential packages and configuring instance...")
         self._load_config()
 
         if self.distro_set == "alpine":
@@ -380,8 +522,25 @@ ip link del {veth_br} 2>/dev/null || true
             commands  = ["apt-get update"]
         else:
             shell_rcd = "ash"
-            print(f"  Unknown distro: {self.distro_set}, skipping configuration")
-            return
+            commands  = []
+            print(f"  Unknown distro: {self.distro_set}, skipping package setup")
+
+        # Optional build: install the bundled package set for this distro.
+        if self.build and commands:
+            build = self._load_build(self.build)
+            if build["distro"] and build["distro"] != self.distro_set:
+                print(f"  Build '{self.build}' targets {build['distro']}, but this "
+                      f"environment is {self.distro_set} - skipping its packages.")
+            elif build["packages"]:
+                pkgs = " ".join(build["packages"])
+                print(f" Installing build '{self.build}' packages: {pkgs}")
+                if self.distro_set == "alpine":
+                    commands.append(f"apk add --no-cache {pkgs}")
+                else:
+                    commands.append(
+                        f"DEBIAN_FRONTEND=noninteractive apt-get install -y "
+                        f"--no-install-recommends {pkgs}"
+                    )
 
         for cmd in commands:
             result = subprocess.run(
@@ -394,13 +553,20 @@ ip link del {veth_br} 2>/dev/null || true
 
         print("Configuration complete")
 
-        # ── Network isolation ──
+        # ── Network isolation (applies to every distro, including custom) ──
         self._setup_network()
 
     # ── Public commands ────────────────────────────────────────────────────────
 
     def init(self):
         self.config_dir.mkdir(exist_ok=True)
+
+        # Validate the build early (bad name/unknown build fails before any
+        # download), and let the build pick the distro when the user didn't.
+        if self.build:
+            build = self._load_build(self.build)
+            if self.distro_set is None and build["distro"]:
+                self.distro_set = build["distro"]
 
         if self.distro_set is None:
             self.distro_set = self._distro_choice()
@@ -411,7 +577,8 @@ ip link del {veth_br} 2>/dev/null || true
             "instance_name": self.instance_name,
             "distro":        self.distro_set,
             "ip":            self.instance_ip,        # ← persisted IP
-            "created_at":    datetime.utcnow().isoformat(),
+            "build":         self.build,
+            "created_at":    datetime.now(timezone.utc).isoformat(),
         }
 
         with open(self.config_file, "w") as f:
@@ -464,7 +631,11 @@ ip link del {veth_br} 2>/dev/null || true
         print("Exited Linux environment")
 
     def run(self, command):
+        if not self.config_file.exists():
+            print("No LENV environment found. Run 'lenv init' first.")
+            return 1
         self._load_config()
+
         wsl_path  = self._windows_to_wsl_path(self.project_path)
         shell_rcd = "bash" if self.distro_set == "ubuntu" else "ash"
 
@@ -480,16 +651,34 @@ ip link del {veth_br} 2>/dev/null || true
 
         return result.returncode
 
-    def destroy(self):
-        self._load_config()
+    def destroy(self, assume_yes=False):
         if not self.config_file.exists():
             print("No LENV environment found")
             return
+        self._load_config()
 
         with open(self.config_file) as f:
             config = json.load(f)
 
         instance_name = config.get("instance_name", self.instance_name)
+
+        # Never unregister anything that is not a lenv-managed instance name.
+        # A tampered .lenv/config.json must not be able to wipe an unrelated
+        # WSL distro (e.g. the user's main Ubuntu install).
+        if not _INSTANCE_NAME_RE.fullmatch(instance_name):
+            print(f"Refusing to destroy: '{instance_name}' is not a lenv-managed instance.")
+            return
+
+        if not assume_yes:
+            print(f"This will permanently delete the WSL instance '{instance_name}'")
+            print("and everything inside it.")
+            try:
+                answer = input("Continue? (Y/n): ").strip().lower()
+            except EOFError:
+                answer = ""
+            if answer != "y":
+                print("Aborted.")
+                return
 
         # ── Tear down veth before unregistering ──
         self._teardown_network()
@@ -501,15 +690,19 @@ ip link del {veth_br} 2>/dev/null || true
         time.sleep(2)
 
         subprocess.run(
-            ["wsl", "--unregister", self.instance_name],
+            ["wsl", "--unregister", instance_name],
             capture_output=True, text=True, timeout=20,
         )
 
-        import shutil
         if self.config_dir.exists():
             shutil.rmtree(self.config_dir)
 
-        print(f"Destroyed environment: {self.instance_name}")
+        # Also drop the install directory (~/.lenv/instances/<name>) left behind
+        install_dir = self.lenv_home / "instances" / instance_name
+        if install_dir.exists():
+            shutil.rmtree(install_dir, ignore_errors=True)
+
+        print(f"Destroyed environment: {instance_name}")
 
 
     def list_instances(self):
@@ -548,6 +741,9 @@ ip link del {veth_br} 2>/dev/null || true
 
         if self.instance_ip:
             print(f"IP:       {self.instance_ip}")
+
+        if self.build:
+            print(f"Build:    {self.build}")
 
 
         if self.instance_name in self._wsl_output(["--list", "--quiet"]):

@@ -55,12 +55,17 @@ lenv destroy              # remove the environment completely
 | `lenv init` | Create an environment for the current project |
 | `lenv init --distro alpine` | Skip the prompt, use Alpine (or `ubuntu`) |
 | `lenv init --rootfs PATH` | Use your own rootfs tarball (`.tar`, `.tar.gz`, `.tar.xz`) |
+| `lenv init --build NAME` | Also install a bundled package set (e.g. `minimal`, `python-dev`) |
 | `lenv activate` | Open an interactive Linux shell in the project directory |
 | `lenv run <cmd>` | Run a single command inside the environment |
 | `lenv status` | Show environment state for the current project |
 | `lenv list` | List every lenv environment on this machine |
-| `lenv destroy` | Remove the environment (instance + config) |
+| `lenv destroy` | Remove the environment (asks for confirmation; `--yes` skips it) |
 | `lenv --version` | Print the installed version |
+
+Downloaded rootfs tarballs are verified against the official upstream SHA-256
+checksums before use, and `lenv destroy` will never touch a WSL distro whose
+name doesn't match lenv's own naming scheme.
 
 ## How it works
 

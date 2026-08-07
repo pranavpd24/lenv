@@ -1,0 +1,7 @@
+name: minimal
+description: Bare minimum essentials - certificates, curl, git
+distro: alpine
+packages:
+  - ca-certificates
+  - curl
+  - git
