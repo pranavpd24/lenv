@@ -4,13 +4,15 @@ import sys
 import re
 import json
 import shutil
-import tarfile
-import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
-import urllib.request
 import hashlib
 import time
+
+# NOTE: heavy modules (urllib.request, tarfile, tempfile) are imported lazily
+# inside the functions that need them. They pull in http.client/email.* and cost
+# ~60-70ms of interpreter startup — most of the gap between `lenv run` and a
+# compiled CLI — but are only used on the download/validate paths.
 
 # ─── Network isolation constants ───────────────────────────────────────────────
 LENV_BRIDGE   = "lenv-br0"
@@ -179,6 +181,7 @@ class LENV:
         Ubuntu-style SHA256SUMS lists ('<hash> *<filename>').
         Returns the lowercase hex digest, or None if it cannot be determined.
         """
+        import urllib.request   # lazy: pulls in http.client/email.*, ~60ms startup
         try:
             with urllib.request.urlopen(info["sha256_url"], timeout=15) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
@@ -196,6 +199,7 @@ class LENV:
 
     def _validate_custom_rootfs(self, path):
         """Validate a user-supplied rootfs tarball (extension + real tar check)."""
+        import tarfile   # lazy: only needed on this path, costs startup time
         if not path.exists():
             print(f"Provided rootfs path does not exist: {path}")
             sys.exit(1)
@@ -270,6 +274,9 @@ class LENV:
 
         # Download to a temp file first so a failed/partial download can never
         # be mistaken for a valid cached rootfs on the next run.
+        # Lazy imports: both are only needed on the download path.
+        import tempfile
+        import urllib.request
         fd, tmp_name = tempfile.mkstemp(dir=self.rootfs_cache, prefix=".dl-", suffix=".part")
         os.close(fd)
         tmp_path = Path(tmp_name)
@@ -495,16 +502,22 @@ ip link del {veth_br} 2>/dev/null || true
 
         print(f"Creating WSL instance '{self.instance_name}'...")
 
+        # wsl.exe writes status/errors as UTF-16 — decode like _wsl_output,
+        # otherwise the "already exists" check never matches and the error
+        # message prints as garbage.
         result = subprocess.run(
             ["wsl", "--import", self.instance_name, install_path, rootfs_tar],
-            capture_output=True, text=True,
+            capture_output=True,
         )
+        stderr = result.stderr
+        stderr = (stderr.decode("utf-16-le", errors="replace") if b"\x00" in stderr
+                  else stderr.decode("utf-8", errors="replace"))
 
         if result.returncode != 0:
-            if "already exists" in result.stderr.lower():
+            if "already exists" in stderr.lower():
                 print(f"Instance '{self.instance_name}' already exists")
             else:
-                raise Exception(f"Failed to create WSL instance: {result.stderr}")
+                raise Exception(f"Failed to create WSL instance: {stderr}")
 
         self._configure_instance()
         print("WSL instance created successfully")
@@ -703,6 +716,129 @@ ip link del {veth_br} 2>/dev/null || true
             shutil.rmtree(install_dir, ignore_errors=True)
 
         print(f"Destroyed environment: {instance_name}")
+
+
+    @staticmethod
+    def _vhdx_size(path):
+        """On-disk (allocated) size of a VHDX file — sparse-aware, unlike
+        os.path.getsize which reports the virtual (apparent) size."""
+        import ctypes
+        gcf = ctypes.windll.kernel32.GetCompressedFileSizeW
+        gcf.restype = ctypes.c_ulong
+        gcf.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]
+        hi = ctypes.c_ulong(0)
+        lo = gcf(str(path), ctypes.byref(hi))
+        return (hi.value << 32) | lo
+
+    def compact(self, assume_yes=False):
+        """
+        Reclaim disk space from an environment's virtual disk.
+        WSL2 VHDX files grow as the instance writes data but never shrink on
+        their own. Tries WSL's sparse-VHD reclaim first; if the WSL build has
+        that disabled (current builds do, over corruption concerns), rebuilds
+        the disk via export/re-import, which needs no elevation.
+        """
+        if not self.config_file.exists():
+            print("No LENV environment found")
+            return
+        self._load_config()
+
+        vhdx = self.lenv_home / "instances" / self.instance_name / "ext4.vhdx"
+        if not vhdx.exists():
+            print(f"No virtual disk found at {vhdx}")
+            return
+
+        before_apparent = vhdx.stat().st_size
+        before_disk = self._vhdx_size(vhdx)
+
+        # The VHDX must not be attached while it is modified
+        subprocess.run(["wsl", "--terminate", self.instance_name],
+                       capture_output=True, timeout=10)
+        time.sleep(1)
+
+        result = subprocess.run(
+            ["wsl", "--manage", self.instance_name, "--set-sparse", "true"],
+            capture_output=True,
+        )
+        # wsl.exe prints status/errors to stdout, not stderr
+        raw = result.stdout + result.stderr
+        msg = (raw.decode("utf-16-le", "replace") if b"\x00" in raw
+               else raw.decode("utf-8", "replace")).strip()
+
+        if result.returncode == 0:
+            after_disk = self._vhdx_size(vhdx)
+            print(f"VHDX marked sparse: {vhdx}")
+            print(f"  virtual size: {self._format_size(before_apparent)}")
+            print(f"  on disk: {self._format_size(before_disk)} -> {self._format_size(after_disk)}")
+            print("  Deleted files are now returned to Windows automatically")
+            print("  (on delete/fstrim inside the environment).")
+            return
+
+        if "allow-unsafe" in msg:
+            # Current WSL builds gate sparse VHDs behind --allow-unsafe due to
+            # potential data corruption. Do NOT use it. Host-side compact tools
+            # (diskpart/Optimize-VHD) can't help either: blocks freed inside
+            # ext4 still contain stale data, and Windows can't read ext4's
+            # allocation bitmap. Rebuilding the disk from an export contains
+            # only live files, so it always reclaims everything.
+            print("This WSL version has sparse VHDs disabled (data-corruption risk),")
+            print("and diskpart cannot reclaim ext4-deleted blocks. Rebuilding the")
+            print("disk via export/re-import instead — files are preserved.")
+        else:
+            print(f"wsl --manage failed ({msg or 'unknown error'}).")
+            print("Rebuilding the disk via export/re-import instead — files are preserved.")
+
+        print(f"  virtual size: {self._format_size(before_apparent)}")
+        print(f"  on disk now:  {self._format_size(before_disk)}")
+
+        if not assume_yes:
+            try:
+                answer = input("Rebuild now? (Y/n): ").strip().lower()
+            except EOFError:
+                answer = ""
+            if answer != "y":
+                print("Aborted.")
+                return
+
+        import tempfile
+        fd, tar_name = tempfile.mkstemp(dir=self.lenv_home, prefix=".compact-",
+                                        suffix=".tar")
+        os.close(fd)
+        tar = Path(tar_name)
+        try:
+            # 1. Export first — the environment is only touched after a
+            #    complete, non-trivial archive exists.
+            result = subprocess.run(
+                ["wsl", "--export", self.instance_name, str(tar)],
+                capture_output=True, timeout=3600,
+            )
+            if result.returncode != 0 or tar.stat().st_size < 1024 * 1024:
+                print("  Export failed — environment left untouched.")
+                return
+
+            # 2. Rebuild the disk from the archive.
+            subprocess.run(["wsl", "--terminate", self.instance_name],
+                           capture_output=True, timeout=10)
+            time.sleep(1)
+            subprocess.run(["wsl", "--unregister", self.instance_name],
+                           capture_output=True, timeout=30)
+            install_path = str(self.lenv_home / "instances" / self.instance_name)
+            result = subprocess.run(
+                ["wsl", "--import", self.instance_name, install_path, str(tar)],
+                capture_output=True, timeout=3600,
+            )
+            if result.returncode != 0:
+                print("  Re-import FAILED. Your data is safe in this archive:")
+                print(f"    {tar}")
+                print(f"  Restore with: wsl --import {self.instance_name} "
+                      f"\"{install_path}\" \"{tar}\"")
+                return
+        finally:
+            if tar.exists() and self.instance_name in self._wsl_output(["--list", "--quiet"]):
+                tar.unlink(missing_ok=True)
+
+        after_disk = self._vhdx_size(vhdx)
+        print(f"  on disk: {self._format_size(before_disk)} -> {self._format_size(after_disk)}")
 
 
     def list_instances(self):

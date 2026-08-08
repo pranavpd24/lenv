@@ -73,6 +73,17 @@ def main():
     # lenv list
     subparsers.add_parser('list', help='List all lenv environments on this machine')
 
+    # lenv compact
+    compact_parser = subparsers.add_parser(
+        'compact',
+        help='Reclaim disk space from the environment (rebuilds the virtual disk)'
+    )
+    compact_parser.add_argument(
+        '--yes', '-y',
+        action='store_true',
+        help='Skip the confirmation prompt'
+    )
+
     
     args = parser.parse_args()
     
@@ -98,6 +109,8 @@ def main():
                 env.status()
             elif args.command == 'list':
                 env.list_instances()
+            elif args.command == 'compact':
+                env.compact(assume_yes=args.yes)
             else:
                 _print_full_help(parser, subparsers)
 

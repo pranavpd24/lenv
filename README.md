@@ -61,6 +61,7 @@ lenv destroy              # remove the environment completely
 | `lenv run <cmd>` | Run a single command inside the environment |
 | `lenv status` | Show environment state for the current project |
 | `lenv list` | List every lenv environment on this machine |
+| `lenv compact` | Reclaim disk space after deleting files (rebuilds the virtual disk; `--yes` skips the prompt) |
 | `lenv destroy` | Remove the environment (asks for confirmation; `--yes` skips it) |
 | `lenv --version` | Print the installed version |
 
